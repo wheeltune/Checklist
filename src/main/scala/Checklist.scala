@@ -1,17 +1,16 @@
-import scala.concurrent.{ExecutionContext, Future}
 import scala.io.StdIn
 import scala.util.matching.Regex
 
 
 object Checklist {
-  val variablePattern: Regex = """(?iU)[$]((\w+)|([{]([^}]*)[}]))""".r
+  val variablePattern: Regex = """[$]((\pL[\pL\d_]*)|([{]([^}]*)[}]))""".r
 
   def getAttribute[A](globals: Map[String, A], locals: Map[String, A])(name: String): A = {
     locals.getOrElse(name, globals(name))
   }
 
   def evaluate[A](globals: Map[String, String], locals: Map[String, String])(code: String): A = {
-    Eval[A]("""\w+""".r.replaceAllIn(code, (replacer) => getAttribute(globals, locals)(replacer.group(0))))
+    Eval[A]("""(^|\s+)(\pL[\pL\d_]*)($|\s+)""".r.replaceAllIn(code, (replacer) => getAttribute(globals, locals)(replacer.group(2))))
   }
 
   trait Element {
@@ -29,13 +28,13 @@ object Checklist {
   case class Block(lines: Iterable[String]) extends Element {
     val blocks = Map.empty[String, Block]
 
-    val indentPattern: Regex = """(?iU)^([ ]{4}|\t)(.*)$""".r
+    val indentPattern: Regex = """^([ ]{2}|\t)(.*)$""".r
 
-    val functionDefinitionPattern: Regex = """(?iU)^[$][$](\w+)[(](.*)[)]\s*$""".r
-    val functionCallPattern: Regex = """(?iU)^[$](\w+)[(](.*)[)]\s*$""".r
-    val ifPattern: Regex = """(?iU)^[$][$][{](.*)[}]\s*$""".r
-    val elsePattern: Regex = """(?iU)^[$][$]\s*$""".r
-    val inputPattern: Regex = """(?iU)^[-][>]\s*(.*)\s*[:]\s*(\w+)\s*$""".r
+    val functionDefinitionPattern: Regex = """^[$][$](\pL[\pL\d_]*)[(](.*)[)]\s*$""".r
+    val functionCallPattern: Regex = """^[$](\pL[\pL\d_]*)[(](.*)[)]\s*$""".r
+    val ifPattern: Regex = """^[$][$][{](.*)[}]\s*$""".r
+    val elsePattern: Regex = """^[$][$]\s*$""".r
+    val inputPattern: Regex = """^[-][>]\s*(.*)\s*[:]\s*(\pL[\pL\d_]*)\s*[:]\s*(\pL[\pL\d_]*)\s*$""".r
 
     override def run(globalFunctions: Map[String, Function] = Map.empty[String, Function],
                      globals: Map[String, String] = Map.empty[String, String]): List[String] =
@@ -52,26 +51,37 @@ object Checklist {
             val (blockIterator, nextIterator) = linesIterator.span(indentPattern.findFirstIn(_).isDefined)
             linesIterator = nextIterator
 
-            localFunctions += (functionName -> Function("""\s*[,]\s*""".r.split(functionParams),
-              Block(blockIterator.map(indentPattern.findFirstMatchIn(_).get.group(1)).to)))
+            localFunctions += (functionName -> Function(
+              """\s*[,]\s*""".r.split(functionParams),
+              Block(blockIterator.map(indentPattern.findFirstMatchIn(_).get.group(2)).to)))
 
           case functionCallPattern(functionName, functionParams) =>
             result :::= getAttribute(localFunctions, globalFunctions)(functionName)(
               """\s*[,]\s*""".r.split(functionParams), globalFunctions, globals)
 
           case ifPattern(statement) =>
-            val (ifElseIterator, nextIterator) = linesIterator.span(p => elsePattern.findFirstIn(p).isDefined || indentPattern.findFirstIn(p).isDefined)
-            val ifIterator = ifElseIterator.takeWhile(indentPattern.findFirstIn(_).isDefined)
-            if (evaluate[Boolean](globals, locals)(statement))
-              result :::= Block(ifIterator.map(indentPattern.findFirstMatchIn(_).get.group(1)).to).run(
-                globalFunctions ++ localFunctions, globals ++ locals)
-            else
-              result :::= Block(ifElseIterator.map(indentPattern.findFirstMatchIn(_).get.group(1)).to).run(
-                globalFunctions ++ localFunctions, globals ++ locals)
+            val (ifElseIterator, nextIterator) = linesIterator.span(
+              p => elsePattern.findFirstIn(p).isDefined || indentPattern.findFirstIn(p).isDefined)
+            linesIterator = nextIterator
 
-          case inputPattern(description, name) =>
+            if (evaluate[Boolean](globals, locals)(statement)) {
+              val ifIterator = ifElseIterator.takeWhile(indentPattern.findFirstIn(_).isDefined)
+              result :::= Block(ifIterator.map(indentPattern.findFirstMatchIn(_).get.group(2)).to).run(
+                globalFunctions ++ localFunctions, globals ++ locals)
+            } else {
+              val elseIterator = ifElseIterator.dropWhile(indentPattern.findFirstIn(_).isDefined).drop(1)
+              result :::= Block(elseIterator.map(indentPattern.findFirstMatchIn(_).get.group(2)).to).run(
+                globalFunctions ++ localFunctions, globals ++ locals)
+            }
+
+          case inputPattern(description, valueType, name) =>
             print(s"$description: ")
-            locals += (name -> StdIn.readLine())
+            valueType match {
+              case "Строка" =>
+                locals += (name -> ("\"" + StdIn.readLine() + "\""))
+              case _ =>
+                locals += (name -> StdIn.readLine())
+            }
 
           case line =>
             result :::= Item(line).run(globalFunctions ++ localFunctions, globals ++ locals)
@@ -84,9 +94,8 @@ object Checklist {
   case class Item(code: String) extends Element {
     def calculateContext(globals: Map[String, String])(matcher: Regex.Match): String = {
       if (matcher.group(2) == null) {
-        Eval[String]("""(?iU)\w+""".r.replaceAllIn(matcher.group(4), (replacer) => '"' + globals(replacer.group(0)) + '"'))
-      }
-      else {
+        evaluate(globals, Map.empty)(matcher.group(4)).toString
+      } else {
         globals(matcher.group(2))
       }
     }
@@ -94,8 +103,6 @@ object Checklist {
     def substituteVariables(globals: Map[String, String])(code: String): String = {
       var parts = variablePattern.split(code)
       val matches = variablePattern.findAllMatchIn(code).toList
-
-      println(parts.length)
 
       while (parts.length <= matches.length) parts :+= ""
 
@@ -108,5 +115,5 @@ object Checklist {
   }
 
   def run(code: String): List[String] =
-    Block(code.split("\n")).run()
+    Block(code.split("\n")).run().reverse
 }
